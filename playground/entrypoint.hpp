@@ -29,6 +29,8 @@
 **/
 class Lock final {
 public:
+    std::atomic<int> my_lock;
+public:
     /** Deleted copy/move constructor/assignment.
     **/
     Lock(Lock const&) = delete;

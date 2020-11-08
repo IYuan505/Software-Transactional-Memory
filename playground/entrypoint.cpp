@@ -39,6 +39,7 @@
 **/
 Lock::Lock() {
     // ...
+    my_lock = 0;
 }
 
 /** Lock destructor.
@@ -51,12 +52,21 @@ Lock::~Lock() {
 **/
 void Lock::lock() {
     // ...
+    int expected = 0;
+    while(!my_lock.compare_exchange_strong(expected, 1,
+                                        std::memory_order_seq_cst,
+                                        std::memory_order_seq_cst))
+        expected=0;
 }
 
 /** [thread-safe] Release the lock, assuming it is indeed held by the caller.
 **/
 void Lock::unlock() {
     // ...
+    int expected = 1;
+    my_lock.compare_exchange_strong(expected, 0,
+                                    std::memory_order_seq_cst,
+                                    std::memory_order_seq_cst);
 }
 
 // -------------------------------------------------------------------------- //
