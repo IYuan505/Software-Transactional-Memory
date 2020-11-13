@@ -89,6 +89,8 @@ using namespace std;
 // -------------------------------------------------------------------------- //
 
 typedef struct log log_t;
+typedef struct segment_entry segment_entry_t;
+typedef struct read_write_entry read_write_entry_t;
 typedef struct transaction transaction_t;
 typedef struct segment segment_t;
 typedef struct region region_t;
@@ -100,15 +102,28 @@ struct log {
     struct log* next;
 };
 
+struct segment_entry {
+    segment_t* segment;
+    segment_entry_t* next;
+};
+
+struct read_write_entry {
+    atomic<int>* lock;
+    read_write_entry_t* next;
+};
+
 struct transaction {
     log_t* logs;
-    vector<segment_t*> to_free;
-    vector<segment_t*> to_alloc;
+    segment_entry_t* to_free_head;
+    segment_entry_t* to_alloc_head;
+    segment_entry_t* to_alloc_tail;
+    read_write_entry_t* lock_head;
     bool is_ro;
-    vector<atomic<int>*> locks;
+    int start_timestamp;
 };
 
 struct segment {
+    /* First bit: write bit, remaining bits: timestamp*/
     atomic<int> lock;
     void* start;
     size_t size;
@@ -116,8 +131,9 @@ struct segment {
 
 struct region {
     void* start;
+    atomic<int> timestamp;
+    segment_entry_t* segment_head;
     atomic<int> seg_lock;
-    vector<segment_t*> segments;
     size_t size;
     size_t align;
 };
@@ -147,15 +163,22 @@ shared_t tm_create(size_t size, size_t align) noexcept {
     }
 
     memset(region->start, 0, size);
-    region->align = align;
-    region->size = size;
     region->seg_lock = 0;
+    region->size = size;
+    region->align = align;
 
     seg->lock = 0;
     seg->start = region->start;
     seg->size = size;
 
-    region->segments.push_back(seg);
+    segment_entry_t* seg_entry = new (std::nothrow) segment_entry_t();
+    if (unlikely(seg_entry == NULL)) {
+        return invalid_shared;
+    }
+    seg_entry->segment = seg;
+    seg_entry->next = NULL;
+
+    region->segment_head = seg_entry;
 
     return region;
 }
@@ -164,9 +187,14 @@ shared_t tm_create(size_t size, size_t align) noexcept {
 **/
 void tm_destroy(shared_t shared ) noexcept {
     region_t* region = (region_t*) shared;
-    for (auto seg : region->segments) {
-        free(seg->start);
-        delete seg;
+    segment_entry_t* seg_entry_cur = region->segment_head;
+    segment_entry_t* tmp;
+    while (seg_entry_cur != NULL) {
+        free(seg_entry_cur->segment->start);
+        delete seg_entry_cur->segment;
+        tmp = seg_entry_cur->next;
+        delete seg_entry_cur;
+        seg_entry_cur = tmp;
     }
     delete region;
 }
@@ -201,25 +229,35 @@ size_t tm_align(shared_t shared) noexcept {
 
 static inline
 segment_t *find_target_seg(region_t *region, transaction_t *trans, const void *pos) {
-    for (auto seg : region->segments) {
-        if (pos >= seg->start && pos < (char*)seg->start + seg->size) {
-            return seg;
+    segment_entry_t* seg_entry_cur = region->segment_head;
+    while (seg_entry_cur != NULL) {
+        if (pos >= seg_entry_cur->segment->start
+                && pos < (char*)seg_entry_cur->segment->start + seg_entry_cur->segment->size) {
+            return seg_entry_cur->segment;
         }
+        seg_entry_cur = seg_entry_cur->next;
     }
-    for (auto seg : trans->to_alloc) {
-        if (pos >= seg->start && pos < (char*)seg->start + seg->size) {
-            return seg;
+
+    seg_entry_cur = trans->to_alloc_head;
+    while (seg_entry_cur != NULL) {
+        if (pos >= seg_entry_cur->segment->start
+                && pos < (char*)seg_entry_cur->segment->start + seg_entry_cur->segment->size) {
+            return seg_entry_cur->segment;
         }
+        seg_entry_cur = seg_entry_cur->next;
     }
+
     return NULL;
 }
 
 static inline
 bool check_lock(transaction_t* trans, atomic<int>* lock) {
-    for (auto candidate : trans->locks) {
-        if (candidate == lock) {
+    read_write_entry_t* read_write_entry_cur = trans->lock_head;
+    while (read_write_entry_cur != NULL) {
+        if (read_write_entry_cur->lock == lock) {
             return true;
         }
+        read_write_entry_cur = read_write_entry_cur->next;
     }
     return false;
 }
@@ -231,7 +269,13 @@ bool acquire_lock(transaction_t* trans, segment_t* target_seg) {
         if (atomic_compare_exchange_strong(&target_seg->lock, &expected_lock, 1) == false) {
             return false;
         } else {
-            trans->locks.push_back(&target_seg->lock);
+            read_write_entry_t* new_read_write_entry = new (std::nothrow) read_write_entry_t();
+            if (unlikely(new_read_write_entry == NULL)) {
+                return false;
+            }
+            new_read_write_entry->lock = &target_seg->lock;
+            new_read_write_entry->next = trans->lock_head;
+            trans->lock_head = new_read_write_entry;
         }
     }
     return true;
@@ -239,9 +283,14 @@ bool acquire_lock(transaction_t* trans, segment_t* target_seg) {
 
 static inline
 void free_lock(transaction_t* trans) {
-    for (auto lock : trans->locks) {
+    read_write_entry_t* lock_entry = trans->lock_head;
+    read_write_entry_t* tmp;
+    while(lock_entry!=NULL) {
         int expected_lock = 1;
-        atomic_compare_exchange_strong(lock, &expected_lock, 0);
+        atomic_compare_exchange_strong(lock_entry->lock, &expected_lock, 0);
+        tmp = lock_entry->next;
+        delete lock_entry;
+        lock_entry = tmp;
     }
 }
 
@@ -260,27 +309,46 @@ void rollback(transaction_t* trans) {
     }
 
     free_lock(trans);
-
     delete trans;
-    return;
 }
 
 static inline
-void free_segments(region_t *region, vector<segment*> to_free) {
+void alloc_segments(region_t *region, segment_entry_t* to_alloc_head, segment_entry_t* to_alloc_tail){
+    if (to_alloc_tail!=NULL){
+        to_alloc_tail->next = region -> segment_head;
+        region -> segment_head = to_alloc_head;
+    }
+}
+
+static inline
+void free_segments(region_t *region, segment_entry_t* to_free_head) {
     int expected_lock = 0;
     while (atomic_compare_exchange_strong(&region->seg_lock, &expected_lock, 1) == false)
         expected_lock = 0;
 
-    int index = 0;
-    for (auto seg : region->segments) {
-        for (auto seg_to_free : to_free) {
-            if (seg == seg_to_free) {
-                region->segments.erase(region->segments.begin() + index);
-                free(seg->start);
-                delete seg;
+    segment_entry_t* iterator = to_free_head;
+    segment_entry_t* tmp;
+    segment_entry_t* segment = region -> segment_head;
+    segment_entry_t* previous = NULL;
+    while(iterator!=NULL){
+        previous = NULL;
+        while(segment!=NULL){
+            if (segment->segment == iterator->segment){
+                if (previous==NULL){
+                    region -> segment_head = segment -> next;
+                }
+                else {
+                    previous -> next = segment -> next;
+                }
+                delete segment;
+                break;
             }
+            previous = segment;
+            segment = segment->next;
         }
-        ++index;
+        tmp = iterator->next;
+        delete iterator;
+        iterator = tmp;
     }
 
     expected_lock = 1;
@@ -301,8 +369,12 @@ tx_t tm_begin(shared_t shared as(unused), bool is_ro) noexcept {
     if (unlikely(trans == NULL)) {
         return invalid_tx;
     }
-    trans->is_ro = is_ro;
     trans->logs = NULL;
+    trans->to_free_head = NULL;
+    trans->to_alloc_head = NULL;
+    trans->to_alloc_tail = NULL;
+    trans->lock_head = NULL;
+    trans->is_ro = is_ro;
     return (tx_t) trans;
 }
 
@@ -316,7 +388,8 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
     transaction_t *trans = (transaction_t*) tx;
 
     if (!trans ->is_ro) {
-        free_segments(region, trans->to_free);
+        free_segments(region, trans->to_free_head);
+        alloc_segments(region, trans->to_alloc_head, trans->to_alloc_tail);
 
         log_t* write_log = trans->logs;
         log_t* tmp;
@@ -327,12 +400,9 @@ bool tm_end(shared_t shared, tx_t tx) noexcept {
             write_log = tmp;
         }
 
-        for (auto seg : trans->to_alloc)
-            region->segments.push_back(seg);
     }
 
     free_lock(trans);
-
     delete trans;
     return true;
 }
@@ -355,7 +425,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         return false;
     }
 
-    if(acquire_lock(trans, target_seg)==false){
+    if (acquire_lock(trans, target_seg) == false) {
         rollback(trans);
         return false;
     }
@@ -382,7 +452,7 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
         return false;
     }
 
-    if(acquire_lock(trans, target_seg)==false){
+    if (acquire_lock(trans, target_seg) == false) {
         rollback(trans);
         return false;
     }
@@ -430,10 +500,23 @@ Alloc tm_alloc(shared_t shared, tx_t tx as(unused), size_t size, void** target) 
         return Alloc::nomem;
     }
     memset(seg->start, 0, size);
-    *target = seg->start;
     seg->size = size;
     seg->lock = 0;
-    trans->to_alloc.push_back(seg);
+    *target = seg->start;
+
+    segment_entry_t* seg_entry = new (std::nothrow) segment_entry_t();
+    if (unlikely(seg_entry == NULL)) {
+        return Alloc::nomem;
+    }
+    seg_entry->segment = seg;
+
+    seg_entry->next = trans->to_alloc_head;
+    trans->to_alloc_head = seg_entry;
+
+    if (trans->to_alloc_tail==NULL){
+        trans->to_alloc_tail = seg_entry;
+    }
+
 
     return Alloc::success;
 }
@@ -454,15 +537,14 @@ bool tm_free(shared_t shared, tx_t tx, void* target) noexcept {
         return false;
     }
 
-    if (!check_lock(trans, &target_seg->lock)) {
-        int expected_lock = 0;
-        if (atomic_compare_exchange_strong(&target_seg->lock, &expected_lock, 1) == false) {
-            rollback(trans);
-            return false;
-        }
+    segment_entry_t* seg_entry = new (std::nothrow) segment_entry_t();
+    if (unlikely(seg_entry == NULL)) {
+        return invalid_shared;
     }
-    trans->locks.push_back(&target_seg->lock);
-    trans->to_free.push_back(target_seg);
+    seg_entry->segment = target_seg;
+    seg_entry->next = trans->to_free_head;
+    trans->to_free_head = seg_entry;
+
     return true;
 
 }
