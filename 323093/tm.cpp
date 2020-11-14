@@ -414,23 +414,26 @@ void rollback(transaction_t* trans) {
    ================================================================ */
 
 static inline
-read_write_entry_t* has_read_then_remove(transaction_t* trans, atomic<int>* lock) {
+bool has_read_and_remove(transaction_t* trans, atomic<int>* lock, bool remove) {
     read_write_entry_t* read_entry = trans->read_head;
     read_write_entry_t* previous = NULL;
     while (read_entry != NULL) {
         if (read_entry->lock == lock) {
-            if (previous == NULL) {
-                trans->read_head = read_entry->next;
+            if (remove){
+                if (previous == NULL) {
+                    trans->read_head = read_entry->next;
+                }
+                else {
+                    previous->next = read_entry->next;
+                }
+                delete read_entry;
             }
-            else {
-                previous->next = read_entry->next;
-            }
-            return read_entry;
+            return true;
         }
         previous = read_entry;
         read_entry = read_entry->next;
     }
-    return NULL;
+    return false;
 }
 
 static inline
@@ -450,9 +453,9 @@ static inline
 bool add_new_read(transaction_t * trans, segment_t * seg) {
     atomic<int>* lock = &seg->lock;
 
-    read_write_entry_t* read_entry = has_read_then_remove(trans, lock);
+    bool has_read = has_read_and_remove(trans, lock, false);
 
-    if (read_entry == NULL) {
+    if (has_read==false) {
         int lock_value = atomic_load(lock);
         int cur_timestamp = lock_value >> RESERVED_BIT;
         int start_timestamp = trans->start_timestamp;
@@ -460,15 +463,15 @@ bool add_new_read(transaction_t * trans, segment_t * seg) {
         if (lock_value & WRITE_BIT || cur_timestamp > start_timestamp)
             return false;
 
-        read_entry = new (std::nothrow) read_write_entry_t();
+        read_write_entry_t* read_entry = new (std::nothrow) read_write_entry_t();
         if (unlikely(read_entry == NULL)) {
             return false;
         }
+        read_entry->lock = lock;
+        read_entry->next = trans->read_head;
+        trans->read_head = read_entry;
     }
-
-    read_entry->lock = lock;
-    read_entry->next = trans->read_head;
-    trans->read_head = read_entry;
+    
     return true;
 }
 
@@ -477,8 +480,7 @@ static inline
 bool add_new_write(transaction_t* trans, segment_t* target_seg) {
     if (has_written(trans, &target_seg->lock) == false) {
 restart:
-        read_write_entry_t* read_entry = has_read_then_remove(trans, &target_seg->lock);
-        if (read_entry != NULL) delete read_entry;
+        has_read_and_remove(trans, &target_seg->lock, true);
 
         int lock_value = atomic_load(&target_seg->lock);
         int cur_timestamp = lock_value >> RESERVED_BIT;
