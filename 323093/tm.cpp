@@ -88,15 +88,16 @@ using namespace std;
 
 // -------------------------------------------------------------------------- //
 
+#define ACCESS_LENGTH 128
+#define ALIGN 8
+#define ALIGN_SHIFT 3
 #define VALID_BIT 1
 #define ACCESS_MASK 30
 #define WRITTEN_BIT 32
 #define RESERVED_BITS 6
 
 typedef struct batcher batcher_t;
-typedef struct access_log access_log_t;
 typedef struct transaction transaction_t;
-typedef struct segment_entry segment_entry_t;
 typedef struct segment segment_t;
 typedef struct region region_t;
 
@@ -109,35 +110,29 @@ struct batcher {
     int timestamp;
 };
 
-struct access_log {
-    char* position;
-    size_t size;
-    access_log_t* next;
-};
 
 struct transaction {
-    access_log_t* access_log;
-    segment_entry_t* to_alloc_segment_entry;
-    segment_entry_t* to_free_segment_entry;
+    bool access_log[128];
+    segment_t* to_alloc_segment;
+    segment_t* to_free_segment;
     bool is_read_only;
     int timestamp;
 };
 
-struct segment_entry {
-    segment_t* segment;
-    segment_entry_t* next;
-};
 
 struct segment {
     char* start;
     atomic<int>* control;
     size_t size;
+    segment_t* next;
 };
 
 struct region {
     batcher_t batcher;
     mutex segment_lock;
-    segment_entry_t* segment_entry;
+    segment_t* segment;
+    void* start;
+    size_t size;
     size_t align;
 };
 
@@ -167,18 +162,10 @@ segment_t* alloc_segment(size_t size, size_t align){
     memset(segment->control, 0, control_size);
 
     segment->size = size;
+    segment->next = NULL;
     return segment;
 }
 
-segment_entry_t* alloc_segment_entry(segment_t* segment){
-    segment_entry_t* segment_entry = (segment_entry_t*) malloc(sizeof(segment_entry_t));
-    if (unlikely(segment_entry==NULL)){
-        return NULL;
-    }
-    segment_entry->segment = segment;
-    segment_entry->next = NULL;
-    return segment_entry;
-}
 
 /* ================================================================
                       Batcher enter and leave
@@ -214,130 +201,87 @@ void batcher_leave(batcher_t* batcher){
                         Read and write word
    ================================================================ */
 
-
-inline segment_t* find_target_seg_helper(segment_entry_t* segment_entry, const void* position){
-    while(segment_entry != NULL){
-        if (position >= segment_entry->segment->start
-            && position < segment_entry->segment->start + segment_entry->segment->size)
-            return segment_entry->segment;
-        segment_entry = segment_entry->next;
+inline segment_t* find_target_seg(region_t* region, transaction_t* trans, const void* position){
+    segment_t* segment = region->segment;
+    while(segment != NULL){
+        if (position >= segment->start && position < segment->start + segment->size)
+            return segment;
+        segment = segment->next;
     }
+    if (position >= trans->to_alloc_segment->start 
+        && position < trans->to_alloc_segment->start + trans->to_alloc_segment->size)
+        return trans->to_alloc_segment;
     return NULL;
 }
 
-inline segment_t* find_target_seg(region_t* region, transaction_t* trans, const void* position){
-    segment_t* return_segment = NULL;
-    return_segment = find_target_seg_helper(region->segment_entry, position);
-    if (return_segment) return return_segment;
-    return_segment = find_target_seg_helper(trans->to_alloc_segment_entry, position);
-    return return_segment;
-}
-
 inline bool has_access(transaction_t* trans, char* position){
-    access_log_t* access_log = trans->access_log;
-    while (access_log != NULL){
-        // printf("%x, %x, %x\n", position, access_log->position, access_log->position + access_log->size);
-        if (position >= access_log->position
-            && position < access_log->position + access_log->size)
-            return true;
-        access_log = access_log->next;
-    }
-    return false;
+    int log_index = ((uintptr_t)position>>4) & 127;
+    return trans->access_log[log_index];
 }
 
 
 /* ================================================================
                         Cleanup and commit
    ================================================================ */
+
 inline void free_in_region(region_t* region, transaction_t* trans, bool is_rollback) {
-    segment_entry_t* to_free_segment_entry = trans->to_free_segment_entry;
-    if (to_free_segment_entry==NULL) return;
-    segment_entry_t* tmp;
-    if (is_rollback){
-        while(to_free_segment_entry != NULL){
-            tmp = to_free_segment_entry->next;
-            free(to_free_segment_entry);
-            to_free_segment_entry = tmp;
-        }
-    }
-    else {
-        region->segment_lock.lock();
-        while(to_free_segment_entry != NULL){
-            segment_entry_t* segment_entry = region->segment_entry;
-            segment_entry_t* previous_segment_entry = NULL;
-            while(segment_entry != NULL){
-                if (segment_entry->segment == to_free_segment_entry->segment){
-                    if (previous_segment_entry == NULL){
-                        region->segment_entry = segment_entry->next;
-                    }
-                    else
-                        previous_segment_entry->next = segment_entry->next;
-                    free(segment_entry->segment->start);
-                    free(segment_entry->segment->control);
-                    free(segment_entry->segment);
-                    free(segment_entry);
-                    break;
-                }
-                previous_segment_entry = segment_entry;
-                segment_entry = segment_entry->next;
+    segment_t* to_free_segment = trans->to_free_segment;
+    if (to_free_segment==NULL || is_rollback) return;
+
+    region->segment_lock.lock();
+    segment_t* segment = region->segment;
+    segment_t* previous_segment = NULL;
+    while(segment != NULL){
+        if (segment == to_free_segment){
+            if (previous_segment == NULL){
+                region->segment = segment->next;
             }
-
-            tmp = to_free_segment_entry->next;
-            free(to_free_segment_entry);
-            to_free_segment_entry = tmp;
+            else
+                previous_segment->next = segment->next;
+            free(segment->start);
+            free(segment->control);
+            free(segment);
+            break;
         }
-        region->segment_lock.unlock();
-    }
+        previous_segment = segment;
+        segment = segment->next;
+    }   
+    region->segment_lock.unlock();
+    
 }
+
+
 inline void alloc_in_region(region_t* region, transaction_t* trans, bool is_rollback) {
-    segment_entry_t* to_alloc_segment_entry = trans->to_alloc_segment_entry;
-    if (to_alloc_segment_entry==NULL) return;
-    segment_entry_t* tmp;
+    segment_t* to_alloc_segment = trans->to_alloc_segment;
+    if (to_alloc_segment==NULL) return;
+
     if (is_rollback){
-        while(to_alloc_segment_entry != NULL){
-            tmp = to_alloc_segment_entry->next;
-            free(to_alloc_segment_entry->segment->start);
-            free(to_alloc_segment_entry->segment->control);
-            free(to_alloc_segment_entry->segment);
-            free(to_alloc_segment_entry);
-            to_alloc_segment_entry = tmp;
-        }
+        free(to_alloc_segment->start);
+        free(to_alloc_segment->control);
+        free(to_alloc_segment);
     }
     else {
-        while(to_alloc_segment_entry->next != NULL){
-            to_alloc_segment_entry = to_alloc_segment_entry->next;
-        }
         region->segment_lock.lock();
-        to_alloc_segment_entry->next = region->segment_entry;
-        region->segment_entry = trans->to_alloc_segment_entry;
+        to_alloc_segment->next = region->segment;
+        region->segment = trans->to_alloc_segment;
         region->segment_lock.unlock();
     }
 }
 
-inline void clear_access_log(transaction_t* trans){
-    access_log_t* access_log = trans->access_log;
-    access_log_t* tmp;
-    while(access_log != NULL){
-        tmp = access_log->next;
-        free(access_log);
-        access_log = tmp;
-    }
-}
 
 inline void rollback(region_t* region, transaction_t* trans) {
     // printf("ROLLBACK===================================\n");
     free_in_region(NULL, trans, true);
     alloc_in_region(NULL, trans, true);
-    clear_access_log(trans);
     free(trans);
     batcher_leave(&region->batcher);
 }
+
 
 inline void commit(region_t* region, transaction_t* trans) {
     // printf("COMMIT\n");
     free_in_region(region, trans, false);
     alloc_in_region(region, trans, false);
-    clear_access_log(trans);
     free(trans);
     batcher_leave(&region->batcher);
 }
@@ -364,20 +308,13 @@ shared_t tm_create(size_t size, size_t align) noexcept {
         return invalid_shared;
     }
 
-    segment_entry_t* segment_entry = alloc_segment_entry(segment);
-    if (segment_entry==NULL){
-        free(region);
-        free(segment->start);
-        free(segment->control);
-        free(segment);
-        return invalid_shared;
-    }
-
     pthread_mutex_init(&region->batcher.batcher_lock, NULL);
     region->batcher.remaining = 0;
     region->batcher.waiting = 0;
     region->batcher.timestamp = 0;
-    region->segment_entry = segment_entry;
+    region->segment = segment;
+    region->start = (void*) segment->start;
+    region->size = size;
     region->align = align;
     return region;
 }
@@ -385,16 +322,17 @@ shared_t tm_create(size_t size, size_t align) noexcept {
  * @param shared Shared memory region to destroy, with no running transaction
 **/
 void tm_destroy(shared_t shared ) noexcept {
+    // printf("MAX ALLOC %d, MAX_FREE %d.================\n", max_alloc, max_free);
+    // printf("MAX COUNT %d============\n", max_cnt);
     region_t* region = (region_t*) shared;
-    segment_entry_t* segment_entry = region->segment_entry;
-    segment_entry_t* tmp;
-    while(segment_entry!=NULL){
-        tmp = segment_entry->next;
-        free(segment_entry->segment->start);
-        free(segment_entry->segment->control);
-        free(segment_entry->segment);
-        free(segment_entry);
-        segment_entry = tmp;
+    segment_t* segment = region->segment;
+    segment_t* tmp;
+    while(segment != NULL){
+        tmp = segment->next;
+        free(segment->start);
+        free(segment->control);
+        free(segment);
+        segment = tmp;
     }
     free(region);
 }
@@ -404,7 +342,7 @@ void tm_destroy(shared_t shared ) noexcept {
  * @return Start address of the first allocated segment
 **/
 void* tm_start(shared_t shared) noexcept {
-    return (void*)((region_t*) shared)->segment_entry->segment->start;
+    return ((region_t*) shared)->start;
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
@@ -412,7 +350,7 @@ void* tm_start(shared_t shared) noexcept {
  * @return First allocated segment size
 **/
 size_t tm_size(shared_t shared) noexcept {
-    return ((region_t*) shared)->segment_entry->segment->size;
+    return ((region_t*) shared)->size;
 }
 
 /** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
@@ -437,9 +375,9 @@ tx_t tm_begin(shared_t shared, bool is_ro) noexcept {
     }
 
     batcher_enter(&region->batcher, trans);
-    trans->access_log = NULL;
-    trans->to_alloc_segment_entry = NULL;
-    trans->to_free_segment_entry = NULL;
+    memset(trans->access_log, 0, sizeof(trans->access_log));
+    trans->to_alloc_segment = NULL;
+    trans->to_free_segment = NULL;
     trans->is_read_only = is_ro;
 
     return (tx_t) trans;
@@ -474,7 +412,7 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
     int index = (char*)source - target_seg->start;
     char* source_pos = (char*)source + index;
     char* target_pos = (char*)target;
-    atomic<int>* control = target_seg->control + (index / align);
+    atomic<int>* control = target_seg->control + (index >> ALIGN_SHIFT);
 
 restart:
     int control_value = atomic_load(control);
@@ -496,34 +434,27 @@ restart:
 
     bool in_access_set = has_access(trans, source_pos);
     if (trans->is_read_only){
-        memcpy(target_pos, source_pos + (valid * align), align);
+        memcpy(target_pos, source_pos + (valid * align), size);
         return true;
     }
     else {
         if (written){
             if (in_access_set){
-                memcpy(target_pos, source_pos + ((1 - valid) * align), align);
+                memcpy(target_pos, source_pos + ((1 - valid) * align), size);
             }
             else
                 return false;
         }
         else {
-            memcpy(target_pos, source_pos + (valid * align), align);
+            memcpy(target_pos, source_pos + (valid * align), size);
             if (!in_access_set)
                 access_cnt += 1;
             int target_control_value = (timestamp<<RESERVED_BITS) | (access_cnt<<1) | valid;
             if(unlikely(atomic_compare_exchange_strong(control, &control_value, target_control_value)==false))
                 goto restart;
         }
-        access_log_t* access_log = (access_log_t*) malloc(sizeof(access_log_t));
-        if (unlikely(access_log == NULL)){
-            rollback(region, trans);
-            return false;
-        }
-        access_log->position = source_pos;
-        access_log->size = size + size;
-        access_log->next = trans->access_log;
-        trans->access_log = access_log;
+        int log_index = ((uintptr_t)source_pos >> 4) & 127;
+        trans->access_log[log_index] = true;
     }
 
     
@@ -547,10 +478,10 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     int index = (char*)target - target_seg->start;
     char* source_pos = (char*)source;
     char* target_pos = (char*)target + index;
-    atomic<int>* control = target_seg->control + (index / align);
+    atomic<int>* control = target_seg->control + (index >> ALIGN_SHIFT);
 
 restart:
-    int control_value = atomic_load_explicit(control, memory_order_consume);
+    int control_value = atomic_load(control);
     int valid = control_value & VALID_BIT;
     int access_cnt = (control_value & ACCESS_MASK)>>1;
     int written = control_value & WRITTEN_BIT;
@@ -564,13 +495,13 @@ restart:
         access_cnt = 0;
         timestamp = trans->timestamp;
         control_value = (timestamp << RESERVED_BITS ) | (valid*VALID_BIT);
-        atomic_store_explicit(control, control_value, memory_order_release);
+        atomic_store(control, control_value);
     }
 
     bool in_access_set = has_access(trans, target_pos);
     if (written){
         if (in_access_set){
-            memcpy(target_pos + ((1-valid) * align), source_pos, align);
+            memcpy(target_pos + ((1-valid) * align), source_pos, size);
         }
         else
             return false;
@@ -579,7 +510,7 @@ restart:
 
         if ( (in_access_set && access_cnt>1) || (!in_access_set && access_cnt>0)) return false;
         else {
-            memcpy(target_pos + ((1-valid) * align), source_pos, align);
+            memcpy(target_pos + ((1-valid) * align), source_pos, size);
             if (!in_access_set)
                 access_cnt += 1;
             int target_control_value = (timestamp<<RESERVED_BITS) | WRITTEN_BIT | (access_cnt<<1) | valid;
@@ -590,15 +521,8 @@ restart:
     }
 
     
-    access_log_t* access_log = (access_log_t*) malloc(sizeof(access_log_t));
-    if (unlikely(access_log == NULL)){
-        rollback(region, trans);
-        return false;
-    }
-    access_log->position = target_pos;
-    access_log->size = size + size;
-    access_log->next = trans->access_log;
-    trans->access_log = access_log;
+    int log_index = ((uintptr_t)target_pos >> 4) & 127;
+    trans->access_log[log_index] = true;
     return true;
 }
 
@@ -617,17 +541,7 @@ Alloc tm_alloc(shared_t shared, tx_t tx as(unused), size_t size, void** target) 
     if (segment==NULL){
         return Alloc::nomem;
     }
-
-    segment_entry_t* segment_entry = alloc_segment_entry(segment);
-    if (segment_entry==NULL){
-        free(segment->start);
-        free(segment->control);
-        free(segment);
-        return Alloc::nomem;
-    }
-
-    segment_entry->next = trans->to_alloc_segment_entry;
-    trans->to_alloc_segment_entry = segment_entry;
+    trans->to_alloc_segment = segment;
     *target = segment->start;
     return Alloc::success;
 }
@@ -643,14 +557,7 @@ bool tm_free(shared_t shared, tx_t tx, void* target) noexcept {
     transaction_t* trans = (transaction_t*) tx;
     segment_t* target_seg = find_target_seg(region, trans, target);
 
-    segment_entry_t* segment_entry = alloc_segment_entry(target_seg);
-    if (segment_entry==NULL){
-        rollback(region, trans);
-        return false;
-    }
-
-    segment_entry->next = trans->to_free_segment_entry;
-    trans->to_free_segment_entry = segment_entry;
+    trans->to_free_segment = target_seg;
 
     return true;
 
