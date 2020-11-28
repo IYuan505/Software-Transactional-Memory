@@ -88,8 +88,6 @@ for
 #define RESERVED_BIT 2
 #define WRITE_BIT 1
 #define CLEAR_MASK (~1)
-#define VALID_SHIFT 1
-#define VALID_BIT 2
 
 typedef struct segment_entry segment_entry_t;
 typedef struct read_entry read_entry_t;
@@ -106,11 +104,15 @@ struct segment_entry {
 struct read_entry {
   atomic<int> *lock;
   read_entry_t *next;
+  int read_timestamp;
 };
 
 struct write_entry {
   atomic<int> *lock;
   write_entry_t *next;
+  void *position;
+  char *new_data;
+  size_t size;
 };
 
 struct transaction {
@@ -166,6 +168,16 @@ find_target_segment(region_t *region, transaction_t *trans, const void *pos) {
   return NULL;
 }
 
+static inline read_entry_t *has_read(transaction_t *trans, atomic<int> *lock) {
+  read_entry_t *read_entry = trans->read_entry;
+  while (read_entry != NULL) {
+    if (read_entry->lock == lock)
+      return read_entry;
+    read_entry = read_entry->next;
+  }
+  return NULL;
+}
+
 static inline write_entry_t *has_written(transaction_t *trans,
                                          atomic<int> *lock) {
   write_entry_t *write_entry = trans->write_entry;
@@ -203,6 +215,7 @@ static inline void rollback(transaction_t *trans) {
       int target_lock_value = lock_value & CLEAR_MASK;
       atomic_compare_exchange_strong(write_entry->lock, &lock_value,
                                      target_lock_value);
+      free(write_entry->new_data);
       write_entry_tmp = write_entry->next;
       free(write_entry);
       write_entry = write_entry_tmp;
@@ -231,14 +244,13 @@ static inline void rollback(transaction_t *trans) {
 
 static inline bool commit(region_t *region, transaction_t *trans) {
   read_entry_t *read_entry = trans->read_entry;
-  int start_timestamp = trans->start_timestamp;
   int lock_value, cur_timestamp;
   while (read_entry != NULL) {
     lock_value = atomic_load(read_entry->lock);
     cur_timestamp = lock_value >> RESERVED_BIT;
     if ((has_written(trans, read_entry->lock) == NULL &&
          lock_value & WRITE_BIT) ||
-        cur_timestamp > start_timestamp) {
+        cur_timestamp != read_entry->read_timestamp) {
       rollback(trans);
       return false;
     }
@@ -253,10 +265,9 @@ static inline bool commit(region_t *region, transaction_t *trans) {
     write_entry_t *write_entry_tmp;
     int target_lock_value = expected_timestamp << RESERVED_BIT;
     while (write_entry != NULL) {
-      int valid_block =
-          (atomic_load(write_entry->lock) & VALID_BIT) >> VALID_SHIFT;
-      atomic_store(write_entry->lock,
-                   target_lock_value | ((1 - valid_block) << VALID_SHIFT));
+      memcpy(write_entry->position, write_entry->new_data, write_entry->size);
+      atomic_store(write_entry->lock, target_lock_value);
+      free(write_entry->new_data);
       write_entry_tmp = write_entry->next;
       free(write_entry);
       write_entry = write_entry_tmp;
@@ -333,11 +344,11 @@ shared_t tm_create(size_t size, size_t align) noexcept {
     return invalid_shared;
   }
 
-  if (unlikely(posix_memalign(&(segment->start), align, size << 1) != 0)) {
+  if (unlikely(posix_memalign(&(segment->start), align, size) != 0)) {
     free(segment);
     return invalid_shared;
   }
-  memset(segment->start, 0, size << 1);
+  memset(segment->start, 0, size);
   segment->lock = 0;
   segment->size = size;
 
@@ -459,27 +470,20 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
   }
 
   atomic<int> *lock = &target_segment->lock;
-  bool in_read = false;
   int lock_value = atomic_load(lock);
   int cur_timestamp = lock_value >> RESERVED_BIT;
-  int valid_block = (lock_value & VALID_BIT) >> VALID_SHIFT;
 
   write_entry_t *write_entry = has_written(trans, lock);
   if (write_entry != NULL) {
-    memcpy(target, (char *)source + (1 - valid_block) * target_segment->size,
-           size);
+    int offset = (char *)source - (char *)target_segment->start;
+    memcpy(target, write_entry->new_data + offset, size);
     return true;
   }
 
-  read_entry_t *read_entry = trans->read_entry;
-  while (read_entry != NULL) {
-    if (lock == read_entry->lock)
-      in_read = true;
-    read_entry = read_entry->next;
-  }
+  read_entry_t *read_entry = has_read(trans, lock);
 
-  if (in_read == false && write_entry == NULL) {
-    if (lock_value & WRITE_BIT || cur_timestamp > trans->start_timestamp) {
+  if (read_entry == NULL) {
+    if (lock_value & WRITE_BIT) {
       rollback(trans);
       return false;
     }
@@ -489,11 +493,12 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
       return false;
     }
     read_entry->lock = lock;
+    read_entry->read_timestamp = cur_timestamp;
     read_entry->next = trans->read_entry;
     trans->read_entry = read_entry;
   }
 
-  memcpy(target, (char *)source + valid_block * target_segment->size, size);
+  memcpy(target, source, size);
   return true;
 }
 
@@ -521,11 +526,12 @@ restart:
   atomic<int> *lock = &target_segment->lock;
   int lock_value = atomic_load(lock);
   int cur_timestamp = lock_value >> RESERVED_BIT;
-  int valid_block = (lock_value & VALID_BIT) >> VALID_SHIFT;
 
   write_entry_t *write_entry = has_written(trans, lock);
   if (write_entry == NULL) {
-    if (lock_value & WRITE_BIT || cur_timestamp > trans->start_timestamp) {
+    read_entry_t *read_entry = has_read(trans, lock);
+    if (lock_value & WRITE_BIT ||
+        (read_entry != NULL && cur_timestamp != read_entry->read_timestamp)) {
       rollback(trans);
       return false;
     }
@@ -539,17 +545,22 @@ restart:
       rollback(trans);
       return false;
     }
+    write_entry->new_data = (char *)malloc(target_segment->size);
+    if (unlikely(write_entry->new_data == NULL)) {
+      free(write_entry);
+      rollback(trans);
+      return false;
+    }
     write_entry->lock = lock;
-    memcpy((char *)target_segment->start +
-               (1 - valid_block) * target_segment->size,
-           (char *)target_segment->start + valid_block * target_segment->size,
-           target_segment->size);
+    write_entry->size = target_segment->size;
+    write_entry->position = target_segment->start;
+    memcpy(write_entry->new_data, write_entry->position, write_entry->size);
     write_entry->next = trans->write_entry;
     trans->write_entry = write_entry;
   }
 
-  memcpy((char *)target + (1 - valid_block) * target_segment->size, source,
-         size);
+  int offset = (char *)target - (char *)target_segment->start;
+  memcpy(write_entry->new_data + offset, source, size);
   return true;
 }
 
@@ -574,11 +585,11 @@ Alloc tm_alloc(shared_t shared, tx_t tx as(unused), size_t size,
   }
 
   if (unlikely(posix_memalign((void **)&(segment->start), region->align,
-                              size << 1) != 0)) {
+                              size) != 0)) {
     free(segment);
     return Alloc::nomem;
   }
-  memset(segment->start, 0, size << 1);
+  memset(segment->start, 0, size);
   segment->size = size;
   segment->lock = 0;
   *target = segment->start;
