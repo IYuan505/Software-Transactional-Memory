@@ -111,30 +111,28 @@ struct read_entry {
 struct write_entry {
   atomic<int> *lock;
   write_entry_t *next;
-  // segment_t* segment;
 };
 
 struct transaction {
-  segment_entry_t *to_free_entry;
-  segment_entry_t *to_alloc_entry;
   read_entry_t *read_entry;
   write_entry_t *write_entry;
+  segment_entry_t *to_free_entry;
+  segment_entry_t *to_alloc_entry;
   bool is_ro;
   int start_timestamp;
 };
 
 struct segment {
-  /* First bit: write bit, remaining bits: timestamp*/
-  atomic<int> lock;
   void *start;
+  atomic<int> lock;
   size_t size;
 };
 
 struct region {
-  void *start;
-  atomic<int> timestamp;
   segment_entry_t *segment_entry;
-  pthread_mutex_t segment_lock;
+  atomic<int> segment_lock;
+  atomic<int> timestamp;
+  void *start;
   size_t size;
   size_t align;
 };
@@ -255,9 +253,6 @@ static inline bool commit(region_t *region, transaction_t *trans) {
     write_entry_t *write_entry_tmp;
     int target_lock_value = expected_timestamp << RESERVED_BIT;
     while (write_entry != NULL) {
-      // void* start = write_entry->segment->start;
-      // size_t size = write_entry->segment->size;
-      // memcpy(start, (char*)start + size, size);
       int valid_block =
           (atomic_load(write_entry->lock) & VALID_BIT) >> VALID_SHIFT;
       atomic_store(write_entry->lock,
@@ -270,7 +265,11 @@ static inline bool commit(region_t *region, transaction_t *trans) {
     segment_entry_t *to_free_entry = trans->to_free_entry;
     segment_entry_t *to_alloc_entry = trans->to_alloc_entry;
     if (to_free_entry != NULL) {
-      pthread_mutex_lock(&region->segment_lock);
+      int expected_lock_value = 0;
+      while (unlikely(atomic_compare_exchange_strong(&region->segment_lock,
+                                                     &expected_lock_value,
+                                                     1) == false))
+        expected_lock_value = 0;
       segment_entry_t *tmp;
       segment_entry_t *segment_entry = region->segment_entry;
       segment_entry_t *previous = NULL;
@@ -295,17 +294,21 @@ static inline bool commit(region_t *region, transaction_t *trans) {
         free(to_free_entry);
         to_free_entry = tmp;
       }
-      pthread_mutex_unlock(&region->segment_lock);
+      atomic_store(&region->segment_lock, 0);
     }
 
     if (to_alloc_entry != NULL) {
       while (to_alloc_entry->next != NULL) {
         to_alloc_entry = to_alloc_entry->next;
       }
-      pthread_mutex_lock(&region->segment_lock);
+      int expected_lock_value = 0;
+      while (unlikely(atomic_compare_exchange_strong(&region->segment_lock,
+                                                     &expected_lock_value,
+                                                     1) == false))
+        expected_lock_value = 0;
       to_alloc_entry->next = region->segment_entry;
       region->segment_entry = trans->to_alloc_entry;
-      pthread_mutex_unlock(&region->segment_lock);
+      atomic_store(&region->segment_lock, 0);
     }
   }
   free(trans);
@@ -325,43 +328,42 @@ static inline bool commit(region_t *region, transaction_t *trans) {
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
  **/
 shared_t tm_create(size_t size, size_t align) noexcept {
-  region_t *region = (region_t *)malloc(sizeof(region_t));
-  if (unlikely(region == NULL)) {
-    return invalid_shared;
-  }
-
   segment_t *segment = (segment_t *)malloc(sizeof(segment_t));
   if (unlikely(segment == NULL)) {
-    free(region);
     return invalid_shared;
   }
 
-  if (unlikely(posix_memalign(&(region->start), align, size << 1) != 0)) {
+  if (unlikely(posix_memalign(&(segment->start), align, size << 1) != 0)) {
     free(segment);
-    free(region);
     return invalid_shared;
   }
-
-  memset(region->start, 0, size << 1);
-  region->timestamp = 0;
-  pthread_mutex_init(&region->segment_lock, NULL);
-  region->size = size;
-  region->align = align;
-
+  memset(segment->start, 0, size << 1);
   segment->lock = 0;
-  segment->start = region->start;
   segment->size = size;
 
   segment_entry_t *segment_entry =
       (segment_entry_t *)malloc(sizeof(segment_entry_t));
   if (unlikely(segment_entry == NULL)) {
+    free(segment->start);
+    free(segment);
     return invalid_shared;
   }
   segment_entry->segment = segment;
   segment_entry->next = NULL;
 
+  region_t *region = (region_t *)malloc(sizeof(region_t));
+  if (unlikely(region == NULL)) {
+    free(segment->start);
+    free(segment);
+    free(segment_entry);
+    return invalid_shared;
+  }
   region->segment_entry = segment_entry;
-
+  region->segment_lock = 0;
+  region->timestamp = 0;
+  region->start = segment->start;
+  region->size = size;
+  region->align = align;
   return region;
 }
 /** Destroy (i.e. clean-up + free) a given shared memory region.
@@ -538,14 +540,16 @@ restart:
       return false;
     }
     write_entry->lock = lock;
-    memcpy((char *)target_segment->start + (1 - valid_block) * target_segment->size,
+    memcpy((char *)target_segment->start +
+               (1 - valid_block) * target_segment->size,
            (char *)target_segment->start + valid_block * target_segment->size,
            target_segment->size);
     write_entry->next = trans->write_entry;
     trans->write_entry = write_entry;
   }
 
-  memcpy((char *)target + (1 - valid_block) * target_segment->size, source, size);
+  memcpy((char *)target + (1 - valid_block) * target_segment->size, source,
+         size);
   return true;
 }
 
