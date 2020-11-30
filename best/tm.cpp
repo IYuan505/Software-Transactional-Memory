@@ -167,14 +167,14 @@ find_target_segment(region_t *region, transaction_t *trans, const void *pos) {
   return NULL;
 }
 
-static inline read_entry_t *has_read(transaction_t *trans, atomic<int> *lock){
-    read_entry_t *read_entry = trans->read_entry;
-    while (read_entry != NULL) {
-        if (read_entry->lock == lock)
-            return read_entry;
-        read_entry = read_entry->next;
-    }
-    return NULL;
+static inline read_entry_t *has_read(transaction_t *trans, atomic<int> *lock) {
+  read_entry_t *read_entry = trans->read_entry;
+  while (read_entry != NULL) {
+    if (read_entry->lock == lock)
+      return read_entry;
+    read_entry = read_entry->next;
+  }
+  return NULL;
 }
 
 static inline write_entry_t *has_written(transaction_t *trans,
@@ -473,32 +473,40 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
   int cur_timestamp = lock_value >> RESERVED_BIT;
   int valid_block = (lock_value & VALID_BIT) >> VALID_SHIFT;
 
-  write_entry_t *write_entry = has_written(trans, lock);
-  if (write_entry != NULL) {
-    memcpy(target, (char *)source + (1 - valid_block) * target_segment->size,
-           size);
-    return true;
-  }
-
-  read_entry_t *read_entry = has_read(trans, lock);
-
-  if (read_entry == NULL) {
-    if (lock_value & WRITE_BIT) {
-      rollback(trans);
-      return false;
+  if (trans->is_ro) {
+    if (cur_timestamp > trans->start_timestamp || lock_value & WRITE_BIT){
+        rollback(trans);
+        return false;
     }
-    read_entry_t *read_entry = (read_entry_t *)malloc(sizeof(read_entry_t));
-    if (unlikely(read_entry == NULL)) {
-      rollback(trans);
-      return false;
+    memcpy(target, (char *)source + valid_block * target_segment->size, size);
+  } else {
+    write_entry_t *write_entry = has_written(trans, lock);
+    if (write_entry != NULL) {
+      memcpy(target, (char *)source + (1 - valid_block) * target_segment->size,
+             size);
+      return true;
     }
-    read_entry->lock = lock;
-    read_entry->read_timestamp = cur_timestamp;
-    read_entry->next = trans->read_entry;
-    trans->read_entry = read_entry;
-  }
 
-  memcpy(target, (char *)source + valid_block * target_segment->size, size);
+    read_entry_t *read_entry = has_read(trans, lock);
+
+    if (read_entry == NULL) {
+      if (lock_value & WRITE_BIT) {
+        rollback(trans);
+        return false;
+      }
+      read_entry_t *read_entry = (read_entry_t *)malloc(sizeof(read_entry_t));
+      if (unlikely(read_entry == NULL)) {
+        rollback(trans);
+        return false;
+      }
+      read_entry->lock = lock;
+      read_entry->read_timestamp = cur_timestamp;
+      read_entry->next = trans->read_entry;
+      trans->read_entry = read_entry;
+    }
+
+    memcpy(target, (char *)source + valid_block * target_segment->size, size);
+  }
   return true;
 }
 
@@ -531,9 +539,10 @@ restart:
   write_entry_t *write_entry = has_written(trans, lock);
   if (write_entry == NULL) {
     read_entry_t *read_entry = has_read(trans, lock);
-    if (lock_value & WRITE_BIT || (read_entry != NULL && cur_timestamp != read_entry->read_timestamp)){
-        rollback(trans);
-        return false;
+    if (lock_value & WRITE_BIT ||
+        (read_entry != NULL && cur_timestamp != read_entry->read_timestamp)) {
+      rollback(trans);
+      return false;
     }
     int target_lock_value = lock_value | WRITE_BIT;
     if (unlikely(atomic_compare_exchange_strong(lock, &lock_value,
