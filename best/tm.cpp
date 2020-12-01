@@ -105,8 +105,8 @@ for
 /** Define the maximal value of timestamp **/
 #define MAX_TIMESTAMP 1 << 30
 
-#define BLOCK_SHIFT 5
-#define BLOCK_SIZE 32
+#define BLOCK_SHIFT 3
+#define BLOCK_SIZE 8
 
 typedef struct segment_entry segment_entry_t;
 typedef struct read_entry read_entry_t;
