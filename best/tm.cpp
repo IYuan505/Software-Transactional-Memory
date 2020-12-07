@@ -116,6 +116,11 @@ for
 #define BLOCK_SHIFT 3
 #define BLOCK_SIZE 8
 
+/** Define the default read write entry size
+ **/
+#define DEFAULT_READ_SIZE 8
+#define DEFAULT_WRITE_SIZE 4
+
 /** Define the name of the used struct **/
 typedef struct segment_entry segment_entry_t;
 typedef struct read_entry read_entry_t;
@@ -135,27 +140,30 @@ struct read_entry {   /* Read set entry, used by read-write transactions only */
   int read_timestamp; /* timestamp at the time of reading */
   short block_index;  /* index of the reading block (8 bytes) inside the
                          segment */
-  read_entry_t *next; /* pointer to the next read_entry_t */
 };
 
-struct write_entry {   /* Write set entry */
-  atomic<int> *lock;   /* address of the lock, fast access */
-  segment_t *segment;  /* segment of writing */
-  short block_index;   /* index of the reading block (8 bytes) inside the
-                          segment */
-  write_entry_t *next; /* pointer to the next write_entry_t */
+struct write_entry {  /* Write set entry */
+  atomic<int> *lock;  /* address of the lock, fast access */
+  segment_t *segment; /* segment of writing */
+  short block_index;  /* index of the reading block (8 bytes) inside the
+                         segment */
 };
 
-struct transaction {          /* Transaction */
-  read_entry_t *read_entry;   /* read set of the transaction, a linked list
-                                 (Used only by read-write transactions) */
-  write_entry_t *write_entry; /* write set of the transaction, a linked list */
+struct transaction {        /* Transaction */
+  read_entry_t *read_entry; /* read set of the transaction, a dynamic array
+                               (Used only by read-write transactions) */
+  write_entry_t
+      *write_entry; /* write set of the transaction, a dynamic array */
   segment_t
       *last_accessed_segment;     /* last accessed segment, improve locality. */
   segment_entry_t *to_free_entry; /* segment to free, a linked list. Delay
                                      the free until the commit time */
   segment_entry_t *to_alloc_entry; /* segment to alloc, a linked lsit. Delay
                                       the alloc until the commit time */
+  short read_cnt;                  /* number of read entries */
+  short read_capacity;             /* size of the read_entry array */
+  short write_cnt;                 /* number of write entries */
+  short write_capacity;            /* size of the write_entry array */
   bool is_ro;                      /* is read-only or not */
   int start_timestamp; /* timestamp of the transaction when it starts */
 };
@@ -318,10 +326,10 @@ find_target_segment(region_t *region, transaction_t *trans, const void *pos) {
  **/
 static inline read_entry_t *has_read(transaction_t *trans, atomic<int> *lock) {
   read_entry_t *read_entry = trans->read_entry;
-  while (read_entry != NULL) {
-    if (read_entry->lock == lock)
-      return read_entry;
-    read_entry = read_entry->next;
+  int read_cnt = trans->read_cnt;
+  while (read_cnt--) {
+    if (read_entry[read_cnt].lock == lock)
+      return read_entry + read_cnt;
   }
   return NULL;
 }
@@ -335,11 +343,11 @@ static inline read_entry_t *has_read(transaction_t *trans, atomic<int> *lock) {
 static inline write_entry_t *has_written(transaction_t *trans,
                                          atomic<int> *lock) {
   write_entry_t *write_entry = trans->write_entry;
-  while (write_entry != NULL) {
-    if (write_entry->lock == lock) {
-      return write_entry;
+  int write_cnt = trans->write_cnt;
+  while (write_cnt--) {
+    if (write_entry[write_cnt].lock == lock) {
+      return write_entry + write_cnt;
     }
-    write_entry = write_entry->next;
   }
   return NULL;
 }
@@ -349,13 +357,7 @@ static inline write_entry_t *has_written(transaction_t *trans,
  *  @return       void
  **/
 static inline void clean_read_set(transaction_t *trans) {
-  read_entry_t *read_entry = trans->read_entry;
-  read_entry_t *read_entry_tmp;
-  while (read_entry != NULL) {
-    read_entry_tmp = read_entry->next;
-    free(read_entry);
-    read_entry = read_entry_tmp;
-  }
+  free(trans->read_entry);
 }
 
 /** Rollback the given transaction, clean all memory allocation, release all
@@ -374,17 +376,15 @@ static inline void rollback(transaction_t *trans) {
     clean_read_set(trans);
     /* Clean the write set. */
     write_entry_t *write_entry = trans->write_entry;
-    write_entry_t *write_entry_tmp;
-    while (write_entry != NULL) {
+    int write_cnt = trans->write_cnt;
+    while (write_cnt--) {
       /* Restoret the previous lock value. */
-      int lock_value = atomic_load(write_entry->lock);
+      int lock_value = atomic_load(write_entry[write_cnt].lock);
       int target_lock_value = lock_value & CLEAR_MASK;
-      atomic_compare_exchange_strong(write_entry->lock, &lock_value,
+      atomic_compare_exchange_strong(write_entry[write_cnt].lock, &lock_value,
                                      target_lock_value);
-      write_entry_tmp = write_entry->next;
-      free(write_entry);
-      write_entry = write_entry_tmp;
     }
+    free(trans->write_entry);
 
     /* Clean the to-free segment entries. */
     segment_entry_t *segment_entry = trans->to_free_entry;
@@ -428,26 +428,26 @@ static inline bool commit(region_t *region, transaction_t *trans) {
        the write-locks to current timestamp, free segments and
        allocate segments accordingly. */
 
-    /* Fast path check, if it is the same as the start timestamp, no need to check
-       again. */
+    /* Fast path check, if it is the same as the start timestamp, no need to
+       check again. */
     if (atomic_load(&region->timestamp) != trans->start_timestamp) {
       /* Validate the read. */
       read_entry_t *read_entry = trans->read_entry;
+      int read_cnt = trans->read_cnt;
       int lock_value, cur_timestamp;
-      while (read_entry != NULL) {
+      for (int i = 0; i < read_cnt; ++i) {
         /* If the timestamp is still the same as that when we read
            the block, it means that no other thread has modifies
            that memory region since our read. We can succussfuly
            continue to the next step. */
-        lock_value = atomic_load(read_entry->lock);
+        lock_value = atomic_load(read_entry[i].lock);
         cur_timestamp = lock_value >> RESERVE_BITS;
-        if ((has_written(trans, read_entry->lock) == NULL &&
+        if ((has_written(trans, read_entry[i].lock) == NULL &&
              lock_value & WRITE_BIT) ||
-            cur_timestamp != read_entry->read_timestamp) {
+            cur_timestamp != read_entry[i].read_timestamp) {
           rollback(trans);
           return false;
         }
-        read_entry = read_entry->next;
       }
     }
 
@@ -458,33 +458,33 @@ static inline bool commit(region_t *region, transaction_t *trans) {
 
     /* Write the writes now. */
     write_entry_t *write_entry = trans->write_entry;
-    write_entry_t *write_entry_tmp;
+    int write_cnt = trans->write_cnt;
     int target_lock_value = expected_timestamp << RESERVE_BITS;
-    while (write_entry != NULL) {
-      int lock_value = atomic_load(write_entry->lock);
+    while (write_cnt--) {
+      int lock_value = atomic_load(write_entry[write_cnt].lock);
       /* The current valid block */
       int valid_block = (lock_value & VALID_BIT) >> VALID_SHIFT;
       /* Tell other threads that we are writing to the archieve now. */
-      atomic_store(write_entry->lock, lock_value | ARCHIEVE_BIT);
+      atomic_store(write_entry[write_cnt].lock, lock_value | ARCHIEVE_BIT);
       /* Switch the current valid block to archieve block
          and write the new writes to the archieve block, mark
          it as the new current valid block. */
-      write_entry->segment->archieve_timestamp[write_entry->block_index] =
+      write_entry[write_cnt]
+          .segment->archieve_timestamp[write_entry[write_cnt].block_index] =
           lock_value >> RESERVE_BITS;
-      memcpy((char *)write_entry->segment->start +
-                 (1 - valid_block) * write_entry->segment->size +
-                 write_entry->block_index * BLOCK_SIZE,
-             (char *)write_entry->segment->start +
-                 WRITE_BLOCK_INDEX * write_entry->segment->size +
-                 write_entry->block_index * BLOCK_SIZE,
-             write_entry->segment->block_size[write_entry->block_index]);
+      memcpy((char *)write_entry[write_cnt].segment->start +
+                 (1 - valid_block) * write_entry[write_cnt].segment->size +
+                 write_entry[write_cnt].block_index * BLOCK_SIZE,
+             (char *)write_entry[write_cnt].segment->start +
+                 WRITE_BLOCK_INDEX * write_entry[write_cnt].segment->size +
+                 write_entry[write_cnt].block_index * BLOCK_SIZE,
+             write_entry[write_cnt]
+                 .segment->block_size[write_entry[write_cnt].block_index]);
       /* Set up the new lock value, change the valid block index. */
-      atomic_store(write_entry->lock,
+      atomic_store(write_entry[write_cnt].lock,
                    target_lock_value | ((1 - valid_block) << VALID_SHIFT));
-      write_entry_tmp = write_entry->next;
-      free(write_entry);
-      write_entry = write_entry_tmp;
     }
+    free(trans->write_entry);
 
     segment_entry_t *to_free_entry = trans->to_free_entry;
     segment_entry_t *to_alloc_entry = trans->to_alloc_entry;
@@ -641,11 +641,23 @@ tx_t tm_begin(shared_t shared, bool is_ro) noexcept {
   if (unlikely(trans == NULL)) {
     return invalid_tx;
   }
-  trans->read_entry = NULL;
-  trans->write_entry = NULL;
+  if (is_ro) {
+    trans->read_entry = NULL;
+    trans->write_entry = NULL;
+  }
+  else {
+    trans->read_entry =
+        (read_entry_t *)malloc(sizeof(read_entry_t) * DEFAULT_READ_SIZE);
+    trans->write_entry =
+        (write_entry_t *)malloc(sizeof(write_entry_t) * DEFAULT_WRITE_SIZE);
+  }
   trans->last_accessed_segment = NULL;
   trans->to_free_entry = NULL;
   trans->to_alloc_entry = NULL;
+  trans->read_cnt = 0;
+  trans->read_capacity = DEFAULT_READ_SIZE;
+  trans->write_cnt = 0;
+  trans->write_capacity = DEFAULT_WRITE_SIZE;
   trans->is_ro = is_ro;
   /* Retrieve the start timestamp. */
   trans->start_timestamp = atomic_load(&region->timestamp);
@@ -740,17 +752,17 @@ restart:
          than the start timestamp of the transaction. */
       if (cur_timestamp > trans->start_timestamp) {
         read_entry_t *read_entry = trans->read_entry;
+        int read_cnt = trans->read_cnt;
         int read_lock_value, read_cur_timestamp;
-        while (read_entry != NULL) {
-          read_lock_value = atomic_load(read_entry->lock);
+        for (int i = 0; i < read_cnt; ++i) {
+          read_lock_value = atomic_load(read_entry[i].lock);
           read_cur_timestamp = read_lock_value >> RESERVE_BITS;
-          if ((has_written(trans, read_entry->lock) == NULL &&
+          if ((has_written(trans, read_entry[i].lock) == NULL &&
                read_lock_value & WRITE_BIT) ||
-              read_cur_timestamp != read_entry->read_timestamp) {
+              read_cur_timestamp != read_entry[i].read_timestamp) {
             rollback(trans);
             return false;
           }
-          read_entry = read_entry->next;
         }
         /* If the validation is successful, update the start
            timestamp. Indeed it should be named end_timestamp,
@@ -759,16 +771,21 @@ restart:
       }
 
       /* Allow duplications in the read-set. */
-      read_entry_t *read_entry = (read_entry_t *)malloc(sizeof(read_entry_t));
-      if (unlikely(read_entry == NULL)) {
-        rollback(trans);
-        return false;
-      }
+      read_entry_t *read_entry = trans->read_entry + trans->read_cnt;
       read_entry->lock = lock;
       read_entry->read_timestamp = cur_timestamp;
       read_entry->block_index = block_index;
-      read_entry->next = trans->read_entry;
-      trans->read_entry = read_entry;
+      trans->read_cnt++;
+      if (trans->read_cnt == trans->read_capacity) {
+        trans->read_capacity <<= 1;
+        read_entry_t *new_read_entry = (read_entry_t *)realloc(
+            trans->read_entry, sizeof(read_entry_t) * trans->read_capacity);
+        if (unlikely(new_read_entry == NULL)) {
+          rollback(trans);
+          return false;
+        }
+        trans->read_entry = new_read_entry;
+      }
 
       /* Read the current valid block into the target. */
       memcpy(target, (char *)source + valid_block * target_segment->size, size);
@@ -837,24 +854,21 @@ restart:
       goto restart;
 
     /* Setup the write-entry for necessary information. */
-    write_entry = (write_entry_t *)malloc(sizeof(write_entry_t));
-    if (unlikely(write_entry == NULL)) {
-      rollback(trans);
-      return false;
-    }
+    write_entry = trans->write_entry + trans->write_cnt;
     write_entry->lock = lock;
     write_entry->segment = target_segment;
     write_entry->block_index = block_index;
-    /* This is for padding purpose, not nessary for BLOCK_SIZE=8. */
-    // memcpy((char *)target_segment->start +
-    //            WRITE_BLOCK_INDEX * target_segment->size +
-    //            block_index * BLOCK_SIZE,
-    //        (char *)target_segment->start + valid_block * target_segment->size
-    //        +
-    //            block_index * BLOCK_SIZE,
-    //        target_segment->block_size[block_index]);
-    write_entry->next = trans->write_entry;
-    trans->write_entry = write_entry;
+    trans->write_cnt++;
+    if (trans->write_cnt == trans->write_capacity) {
+      trans->write_capacity <<= 1;
+      write_entry_t *new_write_entry = (write_entry_t *)realloc(
+          trans->write_entry, sizeof(write_entry_t) * trans->write_capacity);
+      if (unlikely(new_write_entry == NULL)) {
+        rollback(trans);
+        return false;
+      }
+      trans->write_entry = new_write_entry;
+    }
 
     memcpy((char *)target + WRITE_BLOCK_INDEX * target_segment->size, source,
            size);
