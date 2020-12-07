@@ -150,8 +150,10 @@ struct transaction {          /* Transaction */
   read_entry_t *read_entry;   /* read set of the transaction, a linked list
                                  (Used only by read-write transactions) */
   write_entry_t *write_entry; /* write set of the transaction, a linked list */
-  segment_entry_t *to_free_entry;  /* segment to free, a linked list. Delay
-                                      the free until the commit time */
+  segment_t
+      *last_accessed_segment;     /* last accessed segment, improve locality. */
+  segment_entry_t *to_free_entry; /* segment to free, a linked list. Delay
+                                     the free until the commit time */
   segment_entry_t *to_alloc_entry; /* segment to alloc, a linked lsit. Delay
                                       the alloc until the commit time */
   bool is_ro;                      /* is read-only or not */
@@ -212,7 +214,8 @@ static inline segment_entry_t *alloc_segment(size_t size, size_t align) {
   }
   /* The number of blocks in each segment. +1 for safety and simplicity. */
   int block_num = (size >> BLOCK_SHIFT) + 1;
-  segment->lock = (atomic<int> *)malloc(sizeof(atomic<int>) * block_num);
+  /* "<< 1", make the lock 8 byte aligned manually */
+  segment->lock = (atomic<int> *)malloc(sizeof(atomic<int>) * block_num << 1);
   if (unlikely(segment->lock == NULL)) {
     free(segment->start);
     free(segment);
@@ -239,7 +242,7 @@ static inline segment_entry_t *alloc_segment(size_t size, size_t align) {
   segment->size = size;
   int tmp_size = size;
   for (int i = 0; i < block_num; ++i) {
-    segment->lock[i] = 0;
+    segment->lock[i << 1] = 0;
     /* The size of each block. The last block will be the remaining size,
        instead of the desired BLOCK_SIZE if the "size" is not aligned with
        the BLOCK_SIZE. */
@@ -276,12 +279,20 @@ static inline segment_entry_t *alloc_segment(size_t size, size_t align) {
  **/
 static inline segment_t *
 find_target_segment(region_t *region, transaction_t *trans, const void *pos) {
+  /* First search the last accessed segment, improve the locality. */
+  if (likely(trans->last_accessed_segment != NULL &&
+             pos >= trans->last_accessed_segment->start &&
+             pos < trans->last_accessed_segment->end)) {
+    return trans->last_accessed_segment;
+  }
+
   segment_entry_t *segment_entry;
   /* Search the "pos" inside the allocated segments of the "region". */
   segment_entry = region->segment_entry;
   while (segment_entry != NULL) {
     if (pos >= segment_entry->segment->start &&
         pos < segment_entry->segment->end) {
+      trans->last_accessed_segment = segment_entry->segment;
       return segment_entry->segment;
     }
     segment_entry = segment_entry->next;
@@ -291,6 +302,7 @@ find_target_segment(region_t *region, transaction_t *trans, const void *pos) {
   while (segment_entry != NULL) {
     if (pos >= segment_entry->segment->start &&
         pos < segment_entry->segment->end) {
+      trans->last_accessed_segment = segment_entry->segment;
       return segment_entry->segment;
     }
     segment_entry = segment_entry->next;
@@ -414,26 +426,31 @@ static inline bool commit(region_t *region, transaction_t *trans) {
   } else {
     /* If it is read-write, we have to validate all reads, update
        the write-locks to current timestamp, free segments and
-       allocate segments accordingly */
+       allocate segments accordingly. */
 
-    /* Validate the read. */
-    read_entry_t *read_entry = trans->read_entry;
-    int lock_value, cur_timestamp;
-    while (read_entry != NULL) {
-      /* If the timestamp is still the same as that when we read
-         the block, it means that no other thread has modifies
-         that memory region since our read. We can succussfuly
-         continue to the next step. */
-      lock_value = atomic_load(read_entry->lock);
-      cur_timestamp = lock_value >> RESERVE_BITS;
-      if ((has_written(trans, read_entry->lock) == NULL &&
-           lock_value & WRITE_BIT) ||
-          cur_timestamp != read_entry->read_timestamp) {
-        rollback(trans);
-        return false;
+    /* Fast path check, if it is the same as the start timestamp, no need to check
+       again. */
+    if (atomic_load(&region->timestamp) != trans->start_timestamp) {
+      /* Validate the read. */
+      read_entry_t *read_entry = trans->read_entry;
+      int lock_value, cur_timestamp;
+      while (read_entry != NULL) {
+        /* If the timestamp is still the same as that when we read
+           the block, it means that no other thread has modifies
+           that memory region since our read. We can succussfuly
+           continue to the next step. */
+        lock_value = atomic_load(read_entry->lock);
+        cur_timestamp = lock_value >> RESERVE_BITS;
+        if ((has_written(trans, read_entry->lock) == NULL &&
+             lock_value & WRITE_BIT) ||
+            cur_timestamp != read_entry->read_timestamp) {
+          rollback(trans);
+          return false;
+        }
+        read_entry = read_entry->next;
       }
-      read_entry = read_entry->next;
     }
+
     clean_read_set(trans);
 
     /* We are safe here, now increment the global timestamp. */
@@ -624,10 +641,11 @@ tx_t tm_begin(shared_t shared, bool is_ro) noexcept {
   if (unlikely(trans == NULL)) {
     return invalid_tx;
   }
-  trans->to_free_entry = NULL;
-  trans->to_alloc_entry = NULL;
   trans->read_entry = NULL;
   trans->write_entry = NULL;
+  trans->last_accessed_segment = NULL;
+  trans->to_free_entry = NULL;
+  trans->to_alloc_entry = NULL;
   trans->is_ro = is_ro;
   /* Retrieve the start timestamp. */
   trans->start_timestamp = atomic_load(&region->timestamp);
@@ -671,7 +689,8 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
       ((char *)source - (char *)target_segment->start) >> BLOCK_SHIFT;
 restart:
   /* Read the lock value, get the necessary information. */
-  atomic<int> *lock = &target_segment->lock[block_index];
+  /* "<< 1", make the lock 8 byte aligned manually */
+  atomic<int> *lock = &target_segment->lock[block_index << 1];
   int lock_value = atomic_load(lock);
   int cur_timestamp = lock_value >> RESERVE_BITS;
   /* To tell which one is current valid block, which one is archieve. */
@@ -785,7 +804,8 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
       ((char *)target - (char *)target_segment->start) >> BLOCK_SHIFT;
 restart:
   /* Read the lock value, get the necessary information. */
-  atomic<int> *lock = &target_segment->lock[block_index];
+  /* "<< 1", make the lock 8 byte aligned manually */
+  atomic<int> *lock = &target_segment->lock[block_index << 1];
   int lock_value = atomic_load(lock);
   int cur_timestamp = lock_value >> RESERVE_BITS;
   // int valid_block = (lock_value & VALID_BIT) >> VALID_SHIFT;
