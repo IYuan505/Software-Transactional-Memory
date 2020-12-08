@@ -1,49 +1,28 @@
 /**
- * @file   tm.c
- * @author Sébastien Rouault <sebastien.rouault@epfl.ch>
+ * @file   tm.cpp
+ * @author LIANG Qiyuan
  *
  * @section LICENSE
  *
- * Copyright © 2018-2019 Sébastien Rouault.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 3 of the License, or
- * any later version. Please see https://gnu.org/licenses/gpl.html
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
  *
  * @section DESCRIPTION
  *
- * Lock-based transaction manager implementation used as the reference.
- **/
-
-// Compile-time configuration
-// #define USE_MM_PAUSE
-// #define USE_PTHREAD_LOCK
-// #define USE_TICKET_LOCK
-#define USE_RW_LOCK
+ * Implementation of your own transaction manager.
+ * You can completely rewrite this file (and create more files) as you wish.
+ * Only the interface (i.e. exported symbols and semantic) must be preserved.
+**/
 
 // Requested features
-#define _POSIX_C_SOURCE 200809 L
+#define _POSIX_C_SOURCE   200809L
 #ifdef __STDC_NO_ATOMICS__
-#error Current C11 compiler does not support atomic operations
+    #error Current C11 compiler does not support atomic operations
 #endif
 
 // External headers
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
-
 #include <atomic>
-#include <mutex>
-#include <shared_mutex>
-#include <vector>
 // Internal headers
-#include <iostream>
 #include <tm.hpp>
 
 using namespace std;
@@ -52,60 +31,62 @@ using namespace std;
 
 /** Define a proposition as likely true.
  * @param prop Proposition
- **/
+**/
 #undef likely
 #ifdef __GNUC__
-#define likely(prop) __builtin_expect((prop) ? 1 : 0, 1)
+    #define likely(prop) \
+        __builtin_expect((prop) ? 1 : 0, 1)
 #else
-#define likely(prop) (prop)
+    #define likely(prop) \
+        (prop)
 #endif
 
 /** Define a proposition as likely false.
  * @param prop Proposition
- **/
+**/
 #undef unlikely
 #ifdef __GNUC__
-#define unlikely(prop) __builtin_expect((prop) ? 1 : 0, 0)
+    #define unlikely(prop) \
+        __builtin_expect((prop) ? 1 : 0, 0)
 #else
-#define unlikely(prop) (prop)
+    #define unlikely(prop) \
+        (prop)
 #endif
 
 /** Define one or several attributes.
  * @param type... Attribute names
- **/
+**/
 #undef as
 #ifdef __GNUC__
-#define as(type...) __attribute__((type))
+    #define as(type...) \
+        __attribute__((type))
 #else
-#define as(type...)
-#warning This compiler has no support
-for
-  GCC attributes
+    #define as(type...)
+    #warning This compiler has no support for GCC attributes
 #endif
 
 // -------------------------------------------------------------------------- //
 
 /** Define the structure of the lock value
- *  3 reserved bits
+ *  4 reserved bits
  *  1st bit is written bit, telling whether this lock is written now.
  *  2nd bit is writing archieve bit, telling whether the archieve is being
  *  written now.
- *  3rd bit is which one is the currrent valid block
+ *  3rd and 4th bit tell which one is the currrent valid block
  **/
 #define RESERVE_BITS 4
 #define WRITE_BIT 1
+#define CLEAR_WRITE_MASK (~1)
 #define ARCHIEVE_BIT 2
 #define VALID_SHIFT 2
-#define VALID_BIT 4
-#define CLEAR_MASK (~1)
+#define VALID_BIT 12
 
-/** Define the structure of the data block
- *  The last block is reserved for temporary writing
- *  The remaining 2 blocks are used both for current valid block and archieve
- *block.
+/** Define the structure of the data block: TL3
+ *  take a circular step, current one is valid block,
+ *  the (current + 1) is the writable block, the (current + 2)
+ *  is the archieve block.
  **/
 #define VERSION_NUM 3
-#define WRITE_BLOCK_INDEX 2
 
 /** Define the maximal value of timestamp **/
 #define MAX_TIMESTAMP 1 << 30
@@ -380,7 +361,7 @@ static inline void rollback(transaction_t *trans) {
     while (write_cnt--) {
       /* Restoret the previous lock value. */
       int lock_value = atomic_load(write_entry[write_cnt].lock);
-      int target_lock_value = lock_value & CLEAR_MASK;
+      int target_lock_value = lock_value & CLEAR_WRITE_MASK;
       atomic_compare_exchange_strong(write_entry[write_cnt].lock, &lock_value,
                                      target_lock_value);
     }
@@ -464,6 +445,8 @@ static inline bool commit(region_t *region, transaction_t *trans) {
       int lock_value = atomic_load(write_entry[write_cnt].lock);
       /* The current valid block */
       int valid_block = (lock_value & VALID_BIT) >> VALID_SHIFT;
+      /* Circular update */
+      int new_valid_block = (valid_block + 1) % VERSION_NUM;
       /* Tell other threads that we are writing to the archieve now. */
       atomic_store(write_entry[write_cnt].lock, lock_value | ARCHIEVE_BIT);
       /* Switch the current valid block to archieve block
@@ -472,17 +455,9 @@ static inline bool commit(region_t *region, transaction_t *trans) {
       write_entry[write_cnt]
           .segment->archieve_timestamp[write_entry[write_cnt].block_index] =
           lock_value >> RESERVE_BITS;
-      memcpy((char *)write_entry[write_cnt].segment->start +
-                 (1 - valid_block) * write_entry[write_cnt].segment->size +
-                 write_entry[write_cnt].block_index * BLOCK_SIZE,
-             (char *)write_entry[write_cnt].segment->start +
-                 WRITE_BLOCK_INDEX * write_entry[write_cnt].segment->size +
-                 write_entry[write_cnt].block_index * BLOCK_SIZE,
-             write_entry[write_cnt]
-                 .segment->block_size[write_entry[write_cnt].block_index]);
       /* Set up the new lock value, change the valid block index. */
       atomic_store(write_entry[write_cnt].lock,
-                   target_lock_value | ((1 - valid_block) << VALID_SHIFT));
+                   target_lock_value | (new_valid_block << VALID_SHIFT));
     }
     free(trans->write_entry);
 
@@ -705,8 +680,10 @@ restart:
   atomic<int> *lock = &target_segment->lock[block_index << 1];
   int lock_value = atomic_load(lock);
   int cur_timestamp = lock_value >> RESERVE_BITS;
-  /* To tell which one is current valid block, which one is archieve. */
+  /* To tell which one is current valid, writable and archieve block. */
   int valid_block = (lock_value & VALID_BIT) >> VALID_SHIFT;
+  int writable_block = (valid_block + 1) % VERSION_NUM;
+  int archieve_block = (valid_block + 2) % VERSION_NUM;
 
   if (trans->is_ro) {
     /* If the current valid block has a higher timestamp or the WRITE_BIT
@@ -720,7 +697,7 @@ restart:
                      trans->start_timestamp) &&
           ((lock_value & ARCHIEVE_BIT) == 0)) {
         memcpy(target,
-               (char *)source + (1 - valid_block) * target_segment->size, size);
+               (char *)source + archieve_block * target_segment->size, size);
         if (unlikely(lock_value != atomic_load(lock)))
           goto restart;
         return true;
@@ -739,7 +716,7 @@ restart:
     write_entry_t *write_entry = has_written(trans, lock);
     /* If we have already written to the block, get the written value. */
     if (write_entry != NULL) {
-      memcpy(target, (char *)source + WRITE_BLOCK_INDEX * target_segment->size,
+      memcpy(target, (char *)source + writable_block * target_segment->size,
              size);
       return true;
     } else {
@@ -825,13 +802,15 @@ restart:
   atomic<int> *lock = &target_segment->lock[block_index << 1];
   int lock_value = atomic_load(lock);
   int cur_timestamp = lock_value >> RESERVE_BITS;
-  // int valid_block = (lock_value & VALID_BIT) >> VALID_SHIFT;
+  /* To tell which one is current valid, writable block. */
+  int valid_block = (lock_value & VALID_BIT) >> VALID_SHIFT;
+  int writable_block = (valid_block + 1) % VERSION_NUM;
 
   write_entry_t *write_entry = has_written(trans, lock);
 
   /* If we has written to this block, overwrite our previous writes. */
   if (write_entry != NULL) {
-    memcpy((char *)target + WRITE_BLOCK_INDEX * target_segment->size, source,
+    memcpy((char *)target + writable_block * target_segment->size, source,
            size);
     return true;
   } else {
@@ -870,7 +849,7 @@ restart:
       trans->write_entry = new_write_entry;
     }
 
-    memcpy((char *)target + WRITE_BLOCK_INDEX * target_segment->size, source,
+    memcpy((char *)target + writable_block * target_segment->size, source,
            size);
     return true;
   }
