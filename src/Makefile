@@ -19,7 +19,7 @@ OBJS     := $(SRCS_C:%=%.o) $(SRCS_CXX:%=%.o)
 CC       := $(CC)
 CCFLAGS  := -Wall -Wextra -Wfatal-errors -O2 -std=c11 -fPIC -I$(INCLUDE_DIR)
 CXX      := $(CXX)
-CXXFLAGS := -Wall -Wextra -Wfatal-errors -O2 -std=c++17 -fPIC -I$(INCLUDE_DIR)
+CXXFLAGS := -Wall -Wextra -Wfatal-errors -O2 -std=c++17 -g -fsanitize=leak -fPIC -I$(INCLUDE_DIR)
 LD       := $(if $(SRCS_CXX),$(CXX),$(CC))
 LDFLAGS  := -shared
 LDLIBS   :=
